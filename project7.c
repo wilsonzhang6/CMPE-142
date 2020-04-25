@@ -13,11 +13,20 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
+#include <sys/wait.h>
+
+#define CONTROLLEN CMSG_LEN(sizeof(int))
+
+void sighandler(int x){}
 
 int main(){
   int sock;
   struct sockaddr_un sock_addr;
   memset(&sock_addr, '\0', sizeof(sock_addr));
+
+  if(signal(SIGUSR1, sighandler) == SIG_ERR){
+    fprintf(stderr, "error %i signal\n", errno);
+  }
 
   int pid = fork();
   if(pid == -1){
@@ -49,22 +58,44 @@ int main(){
     sleep(1);
 
     int shm_fd;
-    if(read(client_socket, &shm_fd, sizeof(int)) == -1){
-      fprintf(stderr, "error %i read shm_fd\n", errno);
-    }
-    printf("Read fd %i\n", shm_fd);
+
+    struct msghdr msg = {0};
+    char msg_buffer[256];
+    struct iovec io = {
+      .iov_base = msg_buffer,
+      .iov_len = sizeof(msg_buffer)
+    };
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    char cmsg_buffer[256];
+    msg.msg_control = cmsg_buffer;
+    msg.msg_controllen = sizeof(cmsg_buffer);
+    if (recvmsg(client_socket, &msg, 0) < 0)
+        fprintf(stderr, "error %i recvmsg\n", errno);
+    struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+    unsigned char * fd = CMSG_DATA(cmsg);
+    shm_fd = *((int*) fd);
+
     void *ptr = mmap(0, sizeof(buffer), PROT_READ, MAP_SHARED, shm_fd, 0);
     if(ptr == (void *) -1){
       fprintf(stderr, "error %i mmap server\n", errno);
     }
 
-    printf("%s\n", (char *)ptr);
-    if(unlink("sock") == -1){
-      fprintf(stderr, "error %i unlink socket\n", errno);
+    while(strcmp((char *)ptr, "exit") != 0){
+      pause();
+      printf("Read from shared memory: %s\n", (char *)ptr);
+    }
+
+    if(close(sock) == -1){
+      fprintf(stderr, "error %i close socket\n", errno);
+    }
+    if(close(client_socket) == -1){
+      fprintf(stderr, "error %i close client_socket\n", errno);
     }
     if(shm_unlink("project7") == -1){
       fprintf(stderr, "error %i shm_unlink\n", errno);
     }
+    exit(0);
   }
 
   //parent, client
@@ -93,13 +124,48 @@ int main(){
       fprintf(stderr, "error %i mmap client\n", errno);
     }
 
-    if(write(sock, &shm_fd, sizeof(int)) == -1){
-      fprintf(stderr, "error %i write shm_fd\n", errno);
+    struct msghdr msg = { 0 };
+    char buf[CMSG_SPACE(sizeof(shm_fd))];
+    memset(buf, '\0', sizeof(buf));
+    struct iovec io = {
+      .iov_base = "project7",
+      .iov_len = 8
+    };
+    msg.msg_iov = &io;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+    struct cmsghdr * cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(shm_fd));
+    *((int *) CMSG_DATA(cmsg)) = shm_fd;
+    msg.msg_controllen = CMSG_SPACE(sizeof(shm_fd));
+    if(sendmsg(sock, &msg, 0) == -1){
+      fprintf(stderr, "error %i send fd\n", errno);
     }
-    printf("Sent fd: %i\n", shm_fd);
-    strcpy(buffer, "hello");
-    if(sprintf(ptr, "%s", buffer) < 0){
-      fprintf(stderr, "error %i write to shm\n", errno);
+
+    printf("Ready for inputs\n");
+    while(strcmp(buffer, "exit") != 0){
+      scanf("%s", buffer);
+      if(sprintf(ptr, "%s", buffer) < 0){
+        fprintf(stderr, "error %i write to shm\n", errno);
+      }
+      kill(pid, SIGUSR1);
+    }
+
+    if(close(sock) == -1){
+      fprintf(stderr, "error %i close socket\n", errno);
+    }
+    if(unlink("sock") == -1){
+      fprintf(stderr, "error %i unlink socket\n", errno);
+    }
+    int exit_status;
+    if(wait(&exit_status) == -1){
+      fprintf(stderr, "error %i wait\n", errno);
+    }
+    if(!WIFEXITED(exit_status) || WEXITSTATUS(exit_status) != 0){
+      fprintf(stderr, "child exitted abnormally\n");
     }
   }
 }
